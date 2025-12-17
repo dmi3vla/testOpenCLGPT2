@@ -45,3 +45,23 @@ __kernel void matrix_multiply(__global const float *A,
     
     C[row * size + col] = sum;
 }
+
+__kernel void matmul_a_bt(__global const float *A,
+                          __global const float *B_T,
+                          __global float *C,
+                          const unsigned int M,
+                          const unsigned int N,
+                          const unsigned int K) {
+    int row = get_global_id(0);
+    int col = get_global_id(1);
+
+    if ((unsigned int)row >= M || (unsigned int)col >= N) return;
+
+    float sum = 0.0f;
+    const unsigned int a_off = ((unsigned int)row) * K;
+    const unsigned int b_off = ((unsigned int)col) * K;
+    for (unsigned int k = 0; k < K; k++) {
+        sum += A[a_off + k] * B_T[b_off + k];
+    }
+    C[((unsigned int)row) * N + (unsigned int)col] = sum;
+}

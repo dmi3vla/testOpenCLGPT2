@@ -19,6 +19,10 @@
 #include<string.h>
 #include<math.h>
 
+#include<CL/cl.h>
+
+#include "test/opencl_gpu_helper.h"
+
 #ifdef GOFAST
 #include<omp.h>
 #endif
@@ -40,6 +44,75 @@ typedef struct {
 } Matrix;
 
 Matrix* layer_weights;
+
+cl_context g_cl_context;
+cl_command_queue g_cl_queue;
+cl_program g_cl_program;
+cl_kernel g_cl_kernel_matmul_a_bt;
+cl_device_id g_cl_device;
+
+char* load_kernel_source(const char* filename, size_t* size) {
+  FILE *fp = fopen(filename, "r");
+  if (!fp) return NULL;
+
+  fseek(fp, 0, SEEK_END);
+  long sz = ftell(fp);
+  fseek(fp, 0, SEEK_SET);
+  if (sz <= 0) {
+    fclose(fp);
+    return NULL;
+  }
+
+  char *source = (char*)malloc((size_t)sz + 1);
+  if (!source) {
+    fclose(fp);
+    return NULL;
+  }
+
+  size_t read_sz = fread(source, 1, (size_t)sz, fp);
+  fclose(fp);
+  source[read_sz] = 0;
+  if (size) *size = read_sz;
+  return source;
+}
+
+void init_opencl() {
+  cl_int err;
+  gpu_device_info_t gpu_info;
+  if (select_best_gpu_device(&gpu_info) != 0) return;
+
+  g_cl_device = gpu_info.device;
+  g_cl_context = create_gpu_context(&gpu_info, &err);
+  if (err != CL_SUCCESS) return;
+
+  g_cl_queue = create_gpu_queue(g_cl_context, &gpu_info, CL_FALSE, &err);
+  if (err != CL_SUCCESS) return;
+
+  size_t source_size;
+  char *source = load_kernel_source("test/matrix_kernels.cl", &source_size);
+  if (!source) return;
+
+  g_cl_program = clCreateProgramWithSource(g_cl_context, 1, (const char**)&source, &source_size, &err);
+  free(source);
+  if (err != CL_SUCCESS) return;
+
+  err = clBuildProgram(g_cl_program, 1, &g_cl_device, NULL, NULL, NULL);
+  if (err != CL_SUCCESS) return;
+
+  g_cl_kernel_matmul_a_bt = clCreateKernel(g_cl_program, "matmul_a_bt", &err);
+  if (err != CL_SUCCESS) return;
+}
+
+void shutdown_opencl() {
+  if (g_cl_kernel_matmul_a_bt) clReleaseKernel(g_cl_kernel_matmul_a_bt);
+  if (g_cl_program) clReleaseProgram(g_cl_program);
+  if (g_cl_queue) clReleaseCommandQueue(g_cl_queue);
+  if (g_cl_context) clReleaseContext(g_cl_context);
+  g_cl_kernel_matmul_a_bt = 0;
+  g_cl_program = 0;
+  g_cl_queue = 0;
+  g_cl_context = 0;
+}
 
 // Standard stuff here. Let's save space with all our loops
 #define LOOP(i, j) for (int i = 0; i < j; i++)
@@ -123,29 +196,76 @@ Matrix transpose(Matrix a) {
 // 4. We re-use computation from prior runs, and only fill in the
 //    *new* rows that weren't populated the prior run through the model
 Matrix matmul_t_fast(Matrix a, Matrix b) {
-  Matrix out = NewMatrix(a.rows, b.rows, !token_processed_upto);
-
-  #ifdef GOFAST
-  #pragma omp parallel
-  #endif
-  {
-  for (int i = token_processed_upto; i < num_total_tokens; i++) {
-	#ifdef GOFAST
-	#pragma omp for
-	#endif
-    for (int j = 0; j < b.rows; j += 4) {
-	  for (int k = 0; k < a.cols; k += 4) {
-		  LOOP(k2,4)
-			LOOP(j2,4)
-			  out.dat[i * b.rows + j+j2] += a.dat[i * a.cols + k+k2] * b.dat[(j+j2) * b.cols + k+k2];
-
-	  }
+  Matrix out = NewMatrix(a.rows, b.rows, 1);
+  if (!g_cl_kernel_matmul_a_bt) {
+    #ifdef GOFAST
+    #pragma omp parallel
+    #endif
+    {
+    #ifdef GOFAST
+    #pragma omp for
+    #endif
+    for (int i = 0; i < a.rows; i++) {
+      for (int j = 0; j < b.rows; j++) {
+        float s = 0;
+        for (int k = 0; k < a.cols; k++) {
+          s += a.dat[i * a.cols + k] * b.dat[j * b.cols + k];
+        }
+        out.dat[i * b.rows + j] = s;
+      }
     }
-  }
+    }
+    return out;
   }
 
-  // Clone the matrix so that we don't clobber our prior computation
-  return add(NewMatrix(out.rows, out.cols, 1), out);
+  cl_int err;
+  size_t bytes_a = (size_t)a.rows * (size_t)a.cols * sizeof(float);
+  size_t bytes_b = (size_t)b.rows * (size_t)b.cols * sizeof(float);
+  size_t bytes_c = (size_t)out.rows * (size_t)out.cols * sizeof(float);
+
+  cl_mem buf_a = clCreateBuffer(g_cl_context, CL_MEM_READ_ONLY, bytes_a, NULL, &err);
+  if (err != CL_SUCCESS) return out;
+  cl_mem buf_b = clCreateBuffer(g_cl_context, CL_MEM_READ_ONLY, bytes_b, NULL, &err);
+  if (err != CL_SUCCESS) {
+    clReleaseMemObject(buf_a);
+    return out;
+  }
+  cl_mem buf_c = clCreateBuffer(g_cl_context, CL_MEM_WRITE_ONLY, bytes_c, NULL, &err);
+  if (err != CL_SUCCESS) {
+    clReleaseMemObject(buf_a);
+    clReleaseMemObject(buf_b);
+    return out;
+  }
+
+  clEnqueueWriteBuffer(g_cl_queue, buf_a, CL_TRUE, 0, bytes_a, a.dat, 0, NULL, NULL);
+  clEnqueueWriteBuffer(g_cl_queue, buf_b, CL_TRUE, 0, bytes_b, b.dat, 0, NULL, NULL);
+
+  cl_uint M = (cl_uint)a.rows;
+  cl_uint N = (cl_uint)b.rows;
+  cl_uint K = (cl_uint)a.cols;
+
+  clSetKernelArg(g_cl_kernel_matmul_a_bt, 0, sizeof(cl_mem), &buf_a);
+  clSetKernelArg(g_cl_kernel_matmul_a_bt, 1, sizeof(cl_mem), &buf_b);
+  clSetKernelArg(g_cl_kernel_matmul_a_bt, 2, sizeof(cl_mem), &buf_c);
+  clSetKernelArg(g_cl_kernel_matmul_a_bt, 3, sizeof(cl_uint), &M);
+  clSetKernelArg(g_cl_kernel_matmul_a_bt, 4, sizeof(cl_uint), &N);
+  clSetKernelArg(g_cl_kernel_matmul_a_bt, 5, sizeof(cl_uint), &K);
+
+  size_t global_work_size[2] = {(size_t)M, (size_t)N};
+  size_t local_work_size[2] = {16, 16};
+  if (local_work_size[0] > global_work_size[0]) local_work_size[0] = 1;
+  if (local_work_size[1] > global_work_size[1]) local_work_size[1] = 1;
+
+  err = clEnqueueNDRangeKernel(g_cl_queue, g_cl_kernel_matmul_a_bt, 2, NULL, global_work_size, local_work_size, 0, NULL, NULL);
+  if (err == CL_SUCCESS) {
+    clFinish(g_cl_queue);
+    clEnqueueReadBuffer(g_cl_queue, buf_c, CL_TRUE, 0, bytes_c, out.dat, 0, NULL, NULL);
+  }
+
+  clReleaseMemObject(buf_a);
+  clReleaseMemObject(buf_b);
+  clReleaseMemObject(buf_c);
+  return out;
 }
 
 // Take a slice out of a larger matrix and return a new matrix with the given shape
@@ -209,7 +329,7 @@ int fix(char* out) {
 
 // Given the ability to byte-pair encode a single word, this encodes a sentence
 // by splitting it into individual words, and tokenizing each word separately
-int* tokenize(char* seq, /*INT*/int* result) {
+int* tokenize(char* seq, /*INT*/int* result, /*INT*/int* result_end) {
   char out[1000];
   int i = 0;
   while (seq[i]) {
@@ -223,6 +343,7 @@ int* tokenize(char* seq, /*INT*/int* result) {
 	fflush(stdout);
 	int k = 0;
 	while (out[k]) {
+	  if (result >= result_end) return result;
 	  fix(out+k);
 	  char* ntok = bpe+best_outi*999;
 	  k += strlen(ntok);
@@ -235,6 +356,7 @@ int* tokenize(char* seq, /*INT*/int* result) {
 
 // Now for the main function that does most of the useful work.
 int main(int tmp, char** argv) {
+  if (tmp < 5) return 1;
   // Initially let's figure out the right hyperparameters for this model
   // argv[1] stores the name of the model we're loading
   // tmp will map 124M -> 0, 355M -> 1, 775M -> 2, 1558M -> 3
@@ -245,15 +367,27 @@ int main(int tmp, char** argv) {
   DIM = NHEAD*64;
   NLAYER = 12*tmp+12;
 
+  init_opencl();
+  atexit(shutdown_opencl);
+
   // Allocate space
   zz = atoi(argv[4]);
-  memory = malloc(2LL*DIM*DIM*NLAYER*zz);
+  size_t activation_bytes = (size_t)2 * (size_t)DIM * (size_t)DIM * (size_t)NLAYER * (size_t)zz;
+  memory = malloc(activation_bytes);
+  if (!memory) {
+	fprintf(stderr, "OOM: failed to allocate %zu bytes for activation memory (zz=%d)\n", activation_bytes, zz);
+	return 1;
+  }
   
   
   /////////////////////////////////////////////////////////////
   ////////////////LOAD BPE FUNCTION INLINED////////////////////
   /////////////////////////////////////////////////////////////
   bpe = malloc(1e9);
+  if (!bpe) {
+    fprintf(stderr, "OOM: failed to allocate %d bytes for BPE table\n", (int)1e9);
+    return 1;
+  }
 
   // load the bpe file from argv[2]
   fp = fopen(argv[2],"r");
@@ -288,9 +422,9 @@ int main(int tmp, char** argv) {
   int history_tokens[1024];
 
   // The initial prompt comes from argv[3]
-  num_total_tokens = tokenize(argv[3], history_tokens) - history_tokens;
+  num_total_tokens = tokenize(argv[3], history_tokens, history_tokens + 1024) - history_tokens;
 
-  int last_newline;
+  int last_newline = 0;
   LOOP(i, num_total_tokens) {
     if (history_tokens[i] == 18861) {
       last_newline = i+1;
@@ -336,11 +470,11 @@ int main(int tmp, char** argv) {
 	printf("\n%s: ", bpe+20490*999);
 	fflush(stdout);
 	
-	fgets(buf+8, 1000, stdin);
+	fgets(buf+8, sizeof(buf)-8, stdin);
 	printf("AI:");
 
 	strcat(buf, "\nBob:");
-	num_total_tokens = tokenize(buf, history_tokens+num_total_tokens)-history_tokens;
+	num_total_tokens = tokenize(buf, history_tokens+num_total_tokens, history_tokens + 1024)-history_tokens;
   
 	memory_top = memory;
 

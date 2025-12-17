@@ -1,1 +1,5 @@
-*.ckpt\n*.out\n*c_chat_gpt_2_gpu
+*.ckpt
+*.out
+c_chat_gpt_2_gpu
+gpt2-124M.ckpt
+a.out
